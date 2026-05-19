@@ -22,8 +22,7 @@ export class RecordAnalysisController {
       throw new UnauthorizedException('No se subió ningún archivo');
     }
 
-    const token = req.headers.authorization;
-    if (!token) throw new UnauthorizedException('Token requerido');
+    const token = this.getAuthorizationToken(req);
 
     const analysis = await this.recordAnalysisService.analiyzeFile(
       file.buffer,
@@ -40,8 +39,7 @@ export class RecordAnalysisController {
       throw new UnauthorizedException('No se subió ningún archivo');
     }
 
-    const token = req.headers.authorization;
-    if (!token) throw new UnauthorizedException('Token requerido');
+    const token = this.getAuthorizationToken(req);
 
     if (!artist) {
       throw new UnauthorizedException('No se proporcionó ningún artista');
@@ -55,5 +53,13 @@ export class RecordAnalysisController {
       artistParsed
     );
     return analysis;
+  }
+
+  private getAuthorizationToken(req: any): string | undefined {
+    const authorization = req.headers.authorization;
+    if (!authorization) return undefined;
+
+    const token = authorization.replace(/^Bearer\s+/i, '').trim();
+    return token || undefined;
   }
 }

@@ -24,7 +24,7 @@ export interface TrackEntry {
   incognito_mode: boolean;
 }
 
-export interface TrackYear{
+export interface TrackYear {
   trackYear: string;
   time: number;
 }

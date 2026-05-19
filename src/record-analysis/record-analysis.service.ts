@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import AdmZip from 'adm-zip';
+import axios from 'axios';
 import { ArtistAnalysis, TrackEntry, TrackYear } from './dto/record.dto';
 import { SpotifyService } from 'src/spotify/spotify.service';
 
@@ -7,7 +8,7 @@ import { SpotifyService } from 'src/spotify/spotify.service';
 export class RecordAnalysisService {
   constructor(private readonly spotifyService: SpotifyService) {}
 
-  public async analiyzeFile(zipBuffer: Buffer, token: string): Promise<any> {
+  public async analiyzeFile(zipBuffer: Buffer, token?: string): Promise<any> {
     const allSongs: TrackEntry[] = this.getAllsongs(zipBuffer);
 
 
@@ -28,10 +29,7 @@ export class RecordAnalysisService {
       allSongs
     );
 
-    const monthsInfo = this.getMonthsInfo(
-      allSongs,
-      token,
-    );
+    const monthsInfo = this.getMonthsInfo(allSongs);
 
     const totalArtists = mostListenedArtist.map(artist => {
         return {artistName:artist.artistName, trackID: artist.trackID}
@@ -64,7 +62,7 @@ export class RecordAnalysisService {
     return allSongs;
   }
 
-  private async getMostListenedArtists(history: TrackEntry[], token: string) {
+  private async getMostListenedArtists(history: TrackEntry[], token?: string) {
     // objeto acumulador
     const artistMap: Record<string, { time: number; trackUri: string }> = {};
     let i = 0;
@@ -92,35 +90,61 @@ export class RecordAnalysisService {
       .map(([artist, data]) => ({
         artistName: artist,
         time: data.time,
-        trackID: data.trackUri.replace('spotify:track:', ''),
+        trackID: data.trackUri?.replace('spotify:track:', '') ?? '',
       }))
       .sort((a, b) => b.time - a.time);
 
-    let firstArtistTrack = await this.spotifyService.getTrack(
-      token,
-      ranking[0].trackID,
-    );
+    if (!token || !ranking[0]?.trackID) {
+      return this.addPublicImageToFirstArtist(ranking);
+    }
 
-    firstArtistTrack.time = ranking[0].time;
-    firstArtistTrack.trackID = ranking[0].trackID;
-    firstArtistTrack.artistName = ranking[0].artistName;
+    try {
+      let firstArtistTrack = await this.spotifyService.getTrack(
+        token,
+        ranking[0].trackID,
+      );
 
+      firstArtistTrack.time = ranking[0].time;
+      firstArtistTrack.trackID = ranking[0].trackID;
+      firstArtistTrack.artistName = ranking[0].artistName;
 
-    ranking[0] = await this.spotifyService.getArtist(
-      token,
-      firstArtistTrack.artists.find(
-        (artist) => (artist.name = ranking[0].artistName),
-      ).id,
-    );
+      const artistId = firstArtistTrack.artists.find(
+        (artist) => artist.name === ranking[0].artistName,
+      )?.id;
 
-    ranking[0].time = firstArtistTrack.time;
-    ranking[0].trackID = firstArtistTrack.trackID;
-    ranking[0].artistName = firstArtistTrack.artistName;
+      if (!artistId) {
+        return this.addPublicImageToFirstArtist(ranking);
+      }
+
+      ranking[0] = await this.spotifyService.getArtist(token, artistId);
+
+      ranking[0].time = firstArtistTrack.time;
+      ranking[0].trackID = firstArtistTrack.trackID;
+      ranking[0].artistName = firstArtistTrack.artistName;
+    } catch {
+      return this.addPublicImageToFirstArtist(ranking);
+    }
+
+    return this.addPublicImageToFirstArtist(ranking);
+  }
+
+  private async addPublicImageToFirstArtist(ranking: any[]) {
+    if (!ranking[0]?.artistName) return ranking;
+
+    const publicImageUrl = await this.getPublicArtistImage(ranking[0].artistName);
+    const currentImages = Array.isArray(ranking[0].images) ? ranking[0].images : [];
+
+    ranking[0].images = publicImageUrl
+      ? [
+          { url: publicImageUrl },
+          ...currentImages.filter((image) => image?.url !== publicImageUrl),
+        ]
+      : currentImages;
 
     return ranking;
   }
 
-  private async getMostListenedTracks(history: TrackEntry[], token: string) {
+  private async getMostListenedTracks(history: TrackEntry[], token?: string) {
     // objeto acumulador
     const trackMap: Record<string, { time: number; trackID: string }> = {};
 
@@ -149,14 +173,22 @@ export class RecordAnalysisService {
       }))
       .sort((a, b) => b.time - a.time);
 
-    let firstTrack = await this.spotifyService.getTrack(
-      token,
-      ranking[0].trackID,
-    );
+    if (!token || !ranking[0]?.trackID) {
+      return ranking;
+    }
 
-    firstTrack.time = ranking[0].time;
+    try {
+      let firstTrack = await this.spotifyService.getTrack(
+        token,
+        ranking[0].trackID,
+      );
 
-    ranking[0] = firstTrack;
+      firstTrack.time = ranking[0].time;
+
+      ranking[0] = firstTrack;
+    } catch {
+      return ranking;
+    }
 
     return ranking;
   }
@@ -183,14 +215,42 @@ export class RecordAnalysisService {
     let ranking = Object.entries(trackMap)
       .map(([trackYear, data]) => ({
         trackYear,
-        time: data.time,
+        time: Number(data.time.toFixed(0)),
       }))
       .sort((a, b) => Number(a.trackYear) - Number(b.trackYear));
 
     return ranking;
   }
 
-  private getMonthsInfo(history: TrackEntry[], token: string) {
+  private getMonthsAndYearsInfo(history: TrackEntry[]): TrackYear[] {
+    const trackMap: Record<string, { time: number }> = {};
+
+    for (const entry of history) {
+      if (entry.spotify_track_uri) {
+        const trackYear = entry.ts.slice(0, 7);
+        const ms = entry.ms_played ?? 0;
+
+        if (!trackYear) continue;
+
+        if (!trackMap[trackYear]) {
+          trackMap[trackYear] = { time: 0 };
+        }
+
+        trackMap[trackYear].time += ms / 60000; // to minutes
+      }
+    }
+
+    let ranking = Object.entries(trackMap)
+      .map(([trackYear, data]) => ({
+        trackYear,
+        time: Number(data.time.toFixed(0)),
+      }))
+      .sort((a, b) => a.trackYear.localeCompare(b.trackYear));
+
+    return ranking.filter(entry => entry.time > 0);
+  }
+
+  private getMonthsInfo(history: TrackEntry[]) {
     const trackMap: Record<string, { time: number }> = {};
 
     for (const entry of history) {
@@ -214,14 +274,14 @@ export class RecordAnalysisService {
     let ranking = Object.entries(trackMap)
       .map(([trackMonth, data]) => ({
         trackMonth,
-        time: data.time,
+        time: data.time.toFixed(0),
       }))
       .sort((a, b) => Number(a.trackMonth) - Number(b.trackMonth));
 
     return ranking;
   }
 
-  public async analyzeArtist(zipBuffer: Buffer, token: string, selectedArtist: any): Promise<ArtistAnalysis> {
+  public async analyzeArtist(zipBuffer: Buffer, token: string | undefined, selectedArtist: any): Promise<ArtistAnalysis> {
 
     // 1. Minutos escuchados del artista
     // 2. 5 Canciones más escuchada del artista
@@ -231,17 +291,26 @@ export class RecordAnalysisService {
 
     const allSongs: TrackEntry[] = this.getAllsongs(zipBuffer);
 
-    let firstArtistTrack = await this.spotifyService.getTrack(
-      token,
-      selectedArtist.trackID,
-    );
+    let spotifyArtist: any = null;
 
-    const spotifyArtist = await this.spotifyService.getArtist(
-      token,
-      firstArtistTrack.artists.find(
-        (artist) => (artist.name = selectedArtist.artistName),
-      ).id,
-    );
+    if (token && selectedArtist.trackID) {
+      try {
+        const firstArtistTrack = await this.spotifyService.getTrack(
+          token,
+          selectedArtist.trackID,
+        );
+
+        const artistId = firstArtistTrack.artists.find(
+          (artist) => artist.name === selectedArtist.artistName,
+        )?.id;
+
+        if (artistId) {
+          spotifyArtist = await this.spotifyService.getArtist(token, artistId);
+        }
+      } catch {
+        spotifyArtist = null;
+      }
+    }
 
     const artistTracks = allSongs
       .filter((entry) =>
@@ -252,17 +321,109 @@ export class RecordAnalysisService {
     const firstTrackListened = this.getFirstTrackByArtist(artistTracks);
     const firstTimeListened = firstTrackListened ? new Date(firstTrackListened.ts).toLocaleDateString('es-ES') : "";
     const firstTrack = firstTrackListened?.master_metadata_track_name;
-    const artistByYears: TrackYear[] = this.getYearsInfo(artistTracks);
+    const artistByYears: TrackYear[] = this.getMonthsAndYearsInfo(artistTracks);
+    const artistImage =
+      spotifyArtist?.images?.[0]?.url ??
+      await this.getPublicArtistImage(selectedArtist.artistName);
 
     return {
       artistName: selectedArtist.artistName,
-      artistImage: spotifyArtist.images[0]?.url,
+      artistImage,
       minutesListened,
       topTracks: [],
       firstTrack,
       firstTimeListened,
       artistByYears
     };
+  }
+
+  private async getPublicArtistImage(artistName: string): Promise<string | undefined> {
+    return (
+      await this.getDeezerArtistImage(artistName) ??
+      await this.getWikidataArtistImage(artistName)
+    );
+  }
+
+  private async getDeezerArtistImage(artistName: string): Promise<string | undefined> {
+    try {
+      const response = await axios.get('https://api.deezer.com/search/artist', {
+        params: {
+          q: artistName,
+          limit: 5,
+        },
+        timeout: 5000,
+      });
+
+      const artists = response.data?.data ?? [];
+      const artist =
+        artists.find((item) => item.name === artistName) ??
+        artists.find((item) => item.name?.toLowerCase() === artistName.toLowerCase()) ??
+        artists[0];
+
+      return artist?.picture_xl ?? artist?.picture_big ?? artist?.picture_medium;
+    } catch (error: any) {
+      console.warn(
+        'Error fetching Deezer artist image:',
+        error.response?.status ?? error.message,
+      );
+      return undefined;
+    }
+  }
+
+  private async getWikidataArtistImage(artistName: string): Promise<string | undefined> {
+    const wikimediaRequestConfig = {
+      headers: {
+        'User-Agent':
+          'spotify-app-backend-nest/0.0.1 (local development; http://localhost:3000)',
+      },
+      timeout: 5000,
+    };
+
+    try {
+      const searchResponse = await axios.get('https://www.wikidata.org/w/api.php', {
+        ...wikimediaRequestConfig,
+        params: {
+          action: 'wbsearchentities',
+          format: 'json',
+          language: 'es',
+          uselang: 'es',
+          search: artistName,
+          limit: 10,
+        },
+      });
+
+      const entityIds = searchResponse.data?.search
+        ?.map((item) => item.id)
+        .filter(Boolean);
+
+      if (!entityIds?.length) return undefined;
+
+      const entityResponse = await axios.get(
+        `https://www.wikidata.org/wiki/Special:EntityData/${entityIds.join('|')}.json`,
+        wikimediaRequestConfig,
+      );
+      const entities = entityResponse.data?.entities ?? {};
+      const entityWithImage = entityIds
+        .map((entityId) => entities[entityId])
+        .find((entity) => entity?.claims?.P18?.[0]?.mainsnak?.datavalue?.value);
+
+      const imageFileName = entityWithImage?.claims?.P18?.[0]?.mainsnak
+        ?.datavalue?.value;
+
+      if (!imageFileName) return undefined;
+
+      return this.getWikimediaImageUrl(imageFileName);
+    } catch (error: any) {
+      console.warn(
+        'Error fetching Wikidata artist image:',
+        error.response?.status ?? error.message,
+      );
+      return undefined;
+    }
+  }
+
+  private getWikimediaImageUrl(fileName: string): string {
+    return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(fileName)}`;
   }
 
   private countMinutesListened(artist: any, history: TrackEntry[]) {
